@@ -103,6 +103,21 @@ module.exports = {
   },
 
   /**
+   * Check if a file exists within the current addons directory
+   * @param {String} relativePath - path to file within current app
+   * @returns {Boolean} whether or not the file exists within the current app
+   */
+  _doesFileExistInCurrentProjectCustomAddons: function(relativePath) {
+    relativePath = path.join('addons', relativePath);
+
+    if (this._existsSync(relativePath)) {
+      return true;
+    }
+
+    return this._doesTemplateFileExist(relativePath);
+  },
+
+  /**
    * Check if a file exists within the current addon directory. Removing `module/<app-name>` from the path.
    * @param {String} relativePath - path to file within current app
    * @returns {Boolean} whether or not the file exists within the current app
@@ -183,6 +198,7 @@ module.exports = {
       this._doesFileExistInDummyApp(relativePath) ||
       this._doesFileExistInCurrentProjectApp(relativePath) ||
       this._doesFileExistInCurrentProjectAddon(relativePath) ||
+      this._doesFileExistInCurrentProjectCustomAddons(relativePath) ||
       this._doesFileExistInCurrentProjectAddonModule(relativePath)
     );
 
