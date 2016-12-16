@@ -114,7 +114,7 @@ module.exports = {
   _doesFileExistInCurrentProjectCustomAddons: function(relativePath) {
     relativePath = path.join('addons', relativePath);
 
-    if (this._existsSync(relativePath) && !relativePath.macth('-test')) {
+    if (this._existsSync(relativePath)) {
       return true;
     }
 
