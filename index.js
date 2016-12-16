@@ -12,10 +12,14 @@ var config = require('./lib/config');
 module.exports = {
   name: 'ember-cli-code-coverage',
 
+  isDevelopingAddon: function() {
+    return true;
+  },
+
   // Ember Methods
 
   included: function() {
-    if (this._isCoverageEnabled() && this.parent.isEmberCLIAddon()) {
+        if (this._isCoverageEnabled() && this.parent.isEmberCLIAddon()) {
       var coveredAddon = this._findCoveredAddon();
       var coverageAddonContext = this;
 
@@ -110,7 +114,7 @@ module.exports = {
   _doesFileExistInCurrentProjectCustomAddons: function(relativePath) {
     relativePath = path.join('addons', relativePath);
 
-    if (this._existsSync(relativePath)) {
+    if (this._existsSync(relativePath) && !relativePath.macth('-test')) {
       return true;
     }
 
