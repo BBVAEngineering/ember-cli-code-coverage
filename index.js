@@ -3,11 +3,34 @@
 var path = require('path');
 var existsSync = require('exists-sync');
 var fs = require('fs-extra');
-var Funnel = require('broccoli-funnel');
-var BroccoliMergeTrees = require('broccoli-merge-trees');
-var CoverageInstrumenter = require('./lib/coverage-instrumenter');
 var attachMiddleware = require('./lib/attach-middleware');
 var config = require('./lib/config');
+const walkSync = require('walk-sync');
+const VersionChecker = require('ember-cli-version-checker');
+const concat = require('lodash.concat');
+
+function requireBabelPlugin(pluginName) {
+  let plugin = require(pluginName);
+
+  plugin = plugin.__esModule ? plugin.default : plugin;
+
+  // adding `baseDir` ensures that broccoli-babel-transpiler does not
+  // issue a warning and opt out of caching
+  let pluginPath = require.resolve(`${pluginName}/package`);
+  let pluginBaseDir = path.dirname(pluginPath);
+  plugin.baseDir = () => pluginBaseDir;
+
+  return plugin;
+}
+
+function getPlugins(appOrAddon) {
+  let options = appOrAddon.options = appOrAddon.options || {};
+  options.babel = options.babel || {};
+  return options.babel.plugins = options.babel.plugins || [];
+}
+
+// Regular expression to extract the file extension from a path.
+const EXT_RE = /\.[^\.]+$/;
 
 module.exports = {
   name: 'ember-cli-code-coverage',
@@ -16,94 +39,104 @@ module.exports = {
     return true;
   },
 
+  /**
+   * Look up the file path from an ember module path.
+   * @type {Object<String, String>}
+   */
+  fileLookup: null,
+
   // Ember Methods
 
   included: function() {
-        if (this._isCoverageEnabled() && this.parent.isEmberCLIAddon()) {
-      var coveredAddon = this._findCoveredAddon();
-      var coverageAddonContext = this;
+    this._super.included.apply(this, arguments);
 
-      coveredAddon.processedAddonJsFiles = function (tree){
-        var instrumentedTree = coverageAddonContext.preprocessTree('addon-js', this.addonJsFiles(tree));
-        return this.preprocessJs(instrumentedTree, '/', this.name, {
-          registry: this.registry
-        });
-      };
+    this.fileLookup = {};
+
+    if (!this._registeredWithBabel && this._isCoverageEnabled()) {
+      let checker = new VersionChecker(this.parent).for('ember-cli-babel', 'npm');
+
+      if (checker.satisfies('>= 6.0.0')) {
+        const IstanbulPlugin = requireBabelPlugin('babel-plugin-istanbul');
+        const exclude = this._getExcludes();
+        const include = this._getIncludes();
+
+        concat(
+          this.app,
+          this._findCoveredAddon(),
+          this._findInRepoAddons()
+        )
+          .filter(Boolean)
+          .map(getPlugins)
+          .forEach((plugins) => plugins.push([IstanbulPlugin, { exclude, include }]));
+
+      } else {
+        this.project.ui.writeWarnLine(
+          'ember-cli-code-coverage: You are using an unsupported ember-cli-babel version,' +
+          'instrumentation will not be available.'
+        );
+      }
+
+      this._registeredWithBabel = true;
     }
   },
 
   contentFor: function(type) {
     if (type === 'test-body-footer' && this._isCoverageEnabled()) {
       var template = fs.readFileSync(path.join(__dirname, 'lib', 'templates', 'test-body-footer.html')).toString();
-      return template.replace('{%PROJECT_NAME%}', this._parentName());
+      return template.replace('{%ENTRIES%}', JSON.stringify(Object.keys(this.fileLookup).map(file => file.replace(EXT_RE, ''))));
     }
 
     return undefined;
   },
 
-  preprocessTree: function(type, tree) {
-    var useBabelInstrumenter = this._getConfig().useBabelInstrumenter === true;
-
-    if (!this._isCoverageEnabled() || (type !== 'js' && type !=='addon-js')) {
-      return tree;
-    }
-
-    var appFiles = new Funnel(tree, {
-      exclude: this._getExcludes()
-    });
-
-    var instrumentedNode = new CoverageInstrumenter(appFiles, {
-      annotation: 'Instrumenting for code coverage',
-      appName: this._parentName(),
-      appRoot: this.parent.root,
-      babelOptions: this.app.options.babel,
-      isAddon: this.project.isEmberCLIAddon(),
-      useBabelInstrumenter: useBabelInstrumenter,
-      templateExtensions: this.registry.extensionsForType('template')
-    });
-
-    return new BroccoliMergeTrees([tree, instrumentedNode], { overwrite: true });
-  },
-
+  /**
+   * If coverage is enabled attach coverage middleware to the express server run by ember-cli
+   * @param {Object} startOptions - Express server start options
+   */
   serverMiddleware: function(startOptions) {
-    this.testemMiddleware(startOptions.app);
+    if (!this._isCoverageEnabled()) {
+      return;
+    }
+    attachMiddleware.serverMiddleware(startOptions.app, {
+      configPath: this.project.configPath(),
+      root: this.project.root,
+      fileLookup: this.fileLookup
+    });
   },
 
   testemMiddleware: function(app) {
-    if (!this._isCoverageEnabled()) { return; }
-    attachMiddleware(app, { root: this.project.root, ui: this.ui });
+    if (!this._isCoverageEnabled()) {
+      return;
+    }
+    const config = {
+      configPath: this.project.configPath(),
+      root: this.project.root,
+      fileLookup: this.fileLookup
+    };
+    // if we're running `ember test --server` use the `serverMiddleware`.
+    if (process.argv.includes('--server') || process.argv.includes('-s')) {
+      return this.serverMiddleware({ app }, config);
+    }
+    attachMiddleware.testMiddleware(app, config);
   },
 
   // Custom Methods
 
   /**
-   * Check if a file exists within the current app directory
-   * @param {String} relativePath - path to file within current app
-   * @returns {Boolean} whether or not the file exists within the current app
+   * Thin wrapper around exists-sync that allows easy stubbing in tests
+   * @param {String} path - path to check existence of
+   * @returns {Boolean} whether or not path exists
    */
-  _doesFileExistInCurrentProjectApp: function(relativePath) {
-    relativePath = path.join('app', relativePath);
-
-    if (this._existsSync(relativePath)) {
-      return true;
-    }
-
-    return this._doesTemplateFileExist(relativePath);
+  _existsSync: function(path) {
+    return existsSync(path);
   },
 
   /**
-   * Check if a file exists within the current addon directory
-   * @param {String} relativePath - path to file within current app
-   * @returns {Boolean} whether or not the file exists within the current app
+   * Get project configuration
+   * @returns {Configuration} project configuration
    */
-  _doesFileExistInCurrentProjectAddon: function(relativePath) {
-    relativePath = path.join('addon', relativePath);
-
-    if (this._existsSync(relativePath)) {
-      return true;
-    }
-
-    return this._doesTemplateFileExist(relativePath);
+  _getConfig: function() {
+    return config(this.project.configPath());
   },
 
   /**
@@ -125,96 +158,97 @@ module.exports = {
    * Check if a file exists within the current addon directory. Removing `module/<app-name>` from the path.
    * @param {String} relativePath - path to file within current app
    * @returns {Boolean} whether or not the file exists within the current app
+   * Get paths to include for coverage
+   * @returns {Array<String>} include paths
    */
-  _doesFileExistInCurrentProjectAddonModule: function(relativePath) {
-    var relativePathWithoutProjectNamePrefix = relativePath.replace('modules' + '/' +  this._parentName(), '');
-    var _relativePath = 'addon/' + relativePathWithoutProjectNamePrefix;
-
-    if (this._existsSync(_relativePath)) {
-      return true;
-    }
-
-    return this._doesTemplateFileExist(_relativePath);
+  _getIncludes: function() {
+    return concat(
+      this._getIncludesForAppDirectory(),
+      this._getIncludesForAppDirectory(),
+      this._getIncludesForCustomAddonsDirectory(),
+      this._getIncludesForAddonDirectory(),
+      this._getIncludesForInRepoAddonDirectories()
+    ).filter(Boolean);
   },
 
   /**
-   * Check if a file exists within the dummy app
-   * @param {String} relativePath - path to file within dummy app
-   * @returns {Boolean} whether or not the file exists within the dummy app
+   * Get paths to include for covering the "app" directory.
+   * @returns {Array<String>} include paths
    */
-  _doesFileExistInDummyApp: function(relativePath) {
-    relativePath = path.join('tests', 'dummy', 'app', relativePath);
-
-    if (this._existsSync(relativePath)) {
-      return true;
-    }
-
-    return this._doesTemplateFileExist(relativePath);
+  _getIncludesForAppDirectory: function() {
+    const dir = path.join(this.project.root, 'app');
+    let prefix = this.parent.isEmberCLIAddon() ? 'dummy' : this.parent.name();
+    return this._getIncludesForDir(dir, prefix);
   },
 
   /**
-   * Check if a template file exists within the current app/addon
-   * Note: Template files are already compiled into JavaScript files so we must
-   * check for the pre-compiled .hbs file
-   * @param {String} relativePath - path to file within current app/addon
-   * @returns {Boolean} whether or not the file exists within the current app/addon
+   * Get paths to include for covering the "app" directory.
+   * @returns {Array<String>} include paths
    */
-  _doesTemplateFileExist: function(relativePath) {
-    var templateExtensions = this.registry.extensionsForType('template');
-
-    for (var i = 0, len = templateExtensions.length; i < len; i++) {
-      var extension = templateExtensions[i];
-      var extensionPath = relativePath.replace('.js', '.' + extension);
-
-      if (this._existsSync(extensionPath)) {
-        return true;
-      }
-    }
-
-    return false;
+  _getIncludesForCustomAddonsDirectory: function() {
+    const dir = path.join(this.project.root, 'addons');
+    let prefix = this.parent.isEmberCLIAddon() ? 'dummy' : this.parent.name();
+    return this._getIncludesForDir(dir, prefix);
   },
 
   /**
-   * Thin wrapper around exists-sync that allows easy stubbing in tests
-   * @param {String} path - path to check existence of
-   * @returns {Boolean} whether or not path exists
+   * Get paths to include for covering the "addon" directory.
+   * @returns {Array<String>} include paths
    */
-  _existsSync: function(path) {
-    return existsSync(path);
+  _getIncludesForAddonDirectory: function() {
+    let addon = this._findCoveredAddon();
+    if (addon) {
+      const addonDir = path.join(this.project.root, 'addon');
+      const addonTestSupportDir = path.join(this.project.root, 'addon-test-support');
+      return concat(
+        this._getIncludesForDir(addonDir, addon.name),
+        this._getIncludesForDir(addonTestSupportDir, `${addon.name}/test-support`)
+      );
+    }
   },
 
   /**
-   * Filter out files that come from other Ember addons and do not live within this app/addon
-   * @param {String} name - name of current app/addon
-   * @param {String} relativePath - relative path to file
-   * @returns {Boolean} whether or not to filter out file
+   * Get paths to include for covering the in-repo-addon directories in "lib/*".
+   * @returns {Array<String>} include paths
    */
-  _filterOutAddonFiles: function(name, relativePath) {
-    if (relativePath.indexOf(name + '/') === 0) {
-      relativePath = relativePath.replace(name + '/', '');
-    }
-
-    if (relativePath.indexOf('dummy/') === 0) {
-      relativePath = relativePath.replace('dummy/', '');
-    }
-
-    var fileExists = (
-      this._doesFileExistInDummyApp(relativePath) ||
-      this._doesFileExistInCurrentProjectApp(relativePath) ||
-      this._doesFileExistInCurrentProjectAddon(relativePath) ||
-      this._doesFileExistInCurrentProjectCustomAddons(relativePath) ||
-      this._doesFileExistInCurrentProjectAddonModule(relativePath)
-    );
-
-    return !fileExists;
+  _getIncludesForInRepoAddonDirectories: function() {
+    return this._findInRepoAddons().reduce((acc, addon) => {
+      let addonDir = path.join(this.project.root, 'lib', addon.name);
+      let addonAppDir = path.join(addonDir, 'app');
+      let addonAddonDir = path.join(addonDir, 'addon');
+      const addonAddonTestSupportDir = path.join(addonDir, 'addon-test-support');
+      return concat(
+        acc,
+        this._getIncludesForDir(addonAppDir, this.parent.name()),
+        this._getIncludesForDir(addonAddonDir, addon.name),
+        this._getIncludesForDir(addonAddonTestSupportDir, `${addon.name}/test-support`)
+      );
+    }, []);
   },
 
   /**
-   * Get project configuration
-   * @returns {Configuration} project configuration
+   * Get paths to include for coverage
+   * @param {String} dir Include all js files under this directory.
+   * @param {String} prefix The prefix to the ember module ('app', 'dummy' or the name of the addon).
+   * @returns {Array<String>} include paths
    */
-  _getConfig: function() {
-    return config(this.project.root);
+  _getIncludesForDir: function(dir, prefix) {
+    if (fs.existsSync(dir)) {
+      let dirname = path.relative(this.project.root, dir);
+      let globs = this.registry.extensionsForType('js').map((extension) => `**/*.${extension}`);
+
+      return walkSync(dir, {
+        directories: false,
+        globs,
+        ignore: ['**/*-test.js']
+      }).map(file => {
+        let module = prefix + '/' + file.replace(EXT_RE, '.js');
+        this.fileLookup[module] = path.join(dirname, file);
+        return module;
+      });
+    } else {
+      return [];
+    }
   },
 
   /**
@@ -222,11 +256,7 @@ module.exports = {
    * @returns {Array<String>} exclude paths
    */
   _getExcludes: function() {
-    var excludes = this._getConfig().excludes || [];
-    var name = this._parentName();
-    excludes.push(this._filterOutAddonFiles.bind(this, name));
-
-    return excludes;
+    return this._getConfig().excludes || [];
   },
 
   /**
@@ -265,5 +295,22 @@ module.exports = {
     }
 
     return this._coveredAddon;
+  },
+
+  /**
+   * Find the app's in-repo addons (if any).
+   * @returns {Array<Addon>} the in-repo addons
+   */
+  _findInRepoAddons: function() {
+    if (!this._inRepoAddons) {
+      const pkg = this.project.pkg;
+      const inRepoAddonPaths = pkg['ember-addon'] && pkg['ember-addon'].paths;
+      this._inRepoAddons = (inRepoAddonPaths || []).map((addonPath) => {
+        let addonName = path.basename(addonPath);
+        return this.project.findAddonByName(addonName);
+      });
+    }
+
+    return this._inRepoAddons;
   }
 };
