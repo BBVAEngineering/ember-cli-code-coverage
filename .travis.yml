@@ -40,4 +40,6 @@ install:
   - bower install
 
 script:
+  - node_modules/.bin/check-dependencies
+  - node_modules/.bin/eslint '**/*.js'
   - npm run-script $NPM_SCRIPT
