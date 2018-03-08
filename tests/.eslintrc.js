@@ -1,9 +1,11 @@
+'use strict';
+
 module.exports = {
-  env: {
-    'embertest': true
-  },
-  parserOptions: {
-    ecmaVersion: 6,
-    sourceType: 'module'
-  }
+	env: {
+		'embertest': true
+	},
+	parserOptions: {
+		ecmaVersion: 6,
+		sourceType: 'module'
+	}
 };
